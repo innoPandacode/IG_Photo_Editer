@@ -5,7 +5,7 @@ block_cipher = None
 
 
 a = Analysis(
-    ['main.py'],
+    ['AutoAddPandaLogo.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -28,7 +28,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='IG_Croper',
+    name='AutoAddPandaLogo',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
