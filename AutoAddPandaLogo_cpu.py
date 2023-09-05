@@ -27,7 +27,7 @@ def add_watermark(input_folder, output_folder, watermark_path, image_filename):
         for orientation in ExifTags.TAGS.keys():
             if ExifTags.TAGS[orientation] == 'Orientation':
                 break
-        if hasattr(img, '_getexif'):
+        if hasattr(img, '_getexif') and img._getexif() is not None:
             exif = dict(img._getexif().items())
             if orientation in exif:
                 if exif[orientation] == 3:
