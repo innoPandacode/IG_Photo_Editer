@@ -53,7 +53,6 @@ def add_watermark(input_folder, output_folder, watermark_path):
     except Exception as e:
         print("An error occurred:", str(e))
 
-
 def add_white_border(input_folder):
     # Iterate through image files in the input folder and add white border
     for filename in os.listdir(input_folder):
@@ -89,7 +88,6 @@ def add_white_border(input_folder):
             new_img.save(output_path)
 
     print("White border added!")
-
 
 def select_logo(watermark_path):
     # List all files in the watermark directory
