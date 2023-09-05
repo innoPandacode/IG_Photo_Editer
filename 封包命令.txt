@@ -1,0 +1,1 @@
+pyinstaller -F -i ig.ico AutoAddPandaLogo_cpu.py
