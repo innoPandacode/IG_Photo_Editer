@@ -5,7 +5,7 @@ block_cipher = None
 
 
 a = Analysis(
-    ['AutoAddPandaLogo.py'],
+    ['AutoAddPandaLogo_cpu.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -28,7 +28,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='AutoAddPandaLogo',
+    name='AutoAddPandaLogo_cpu',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
