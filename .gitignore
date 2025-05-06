@@ -1,0 +1,62 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 編譯與打包相關
+build/
+dist/
+*.egg-info/
+*.spec
+*.pkg
+*.pyz
+*.toc
+*.manifest
+*.zip
+
+# IDE 與開發工具
+.vscode/
+.idea/
+*.iml
+
+# 虛擬環境
+env/
+.venv/
+venv/
+ENV/
+VENV/
+.env/
+
+# 測試與覆蓋率報告
+.tox/
+.nox/
+.coverage
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# 作業系統暫存
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 暫存與日誌
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# 專案中常見不必要上傳的資料夾與檔案
+IG_Photo_Editer-*.zip
+LOGOPATH/
+img/
+*.ico
+*封包命令.txt
+v2.*/  # 所有版本子資料夾，如 v2.4/

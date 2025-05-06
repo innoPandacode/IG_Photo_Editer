@@ -1,4 +1,3 @@
-
 from ui import start_ui
 
 def main():

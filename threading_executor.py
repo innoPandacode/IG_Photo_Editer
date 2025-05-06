@@ -1,18 +1,21 @@
+# threading_executor.py
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def process_images_with_threads(image_files, operation):
-    max_threads = int(os.cpu_count() * 0.8)
-    if max_threads < 1:
-        max_threads = 1
+# threading_executor.py
+def process_images_with_threads(tasks, operation):
+    """
+    tasks: list[tuple] → (input_folder, output_folder, filename)
+    operation: 函式，參數會用 *task 展開
+    """
+    if not tasks:
+        return []
 
-    with ThreadPoolExecutor(max_threads) as executor:
-        futures = [executor.submit(operation, image_file) for image_file in image_files]
+    results = []
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(operation, *task)  # ★ 參數解包
+                   for task in tasks]
+        for f in as_completed(futures):
+            results.append(f.result())
+    return results
 
-        for future in as_completed(futures):
-            try:
-                future.result()  # 確保異常被拋出
-                # 成功完成任務
-            except Exception as e:
-                print(f"Error during image processing: {e}")
-                # 你可以考慮在此處添加更多錯誤處理邏輯

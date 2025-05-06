@@ -1,399 +1,532 @@
 import os
 import sys
+import json
+import queue
+import threading
 import shutil
-import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageTk
-from image_processing import add_watermark, add_white_border_to_image
-import threading
-from threading_executor import process_images_with_threads
+from PIL import Image, ImageTk, ImageOps, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+import pillow_heif
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 專案自有模組
+from image_processing import (
+	correct_orientation,
+	add_watermark,
+	add_white_border_to_image,
+)
+from threading_executor import process_images_with_threads  # 若未使用可改自行實作
+
+# 啟用 HEIF/HEIC 支援
+pillow_heif.register_heif_opener()
+
+# ---- 全域設定 ----
+CONFIG_FILENAME = "config.json"
+PREVIEW_WIDTH, PREVIEW_HEIGHT = 400, 300           # 右側預覽區大小
+FINAL_SIZE = 2048                                   # 輸出正方形邊長
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".heif", ".heic")
+
 
 class ImageProcessingApp:
-    def __init__(self, master):
-        self.master = master
-        self.master.title("Image Processing Tool")
-        
-        self.image_folder = None
-        self.watermark_path = None
-        self.stop_processing = False  # 用於控制處理是否中止
-        
-        # 版本號
-        self.version = "2.1"
-        
-        # 主框架
-        main_frame = tk.Frame(master)
-        main_frame.pack(padx=10, pady=10)
+	"""主 UI 與批次處理"""
 
-        # 左側面板（處理選項）
-        left_pane = tk.Frame(main_frame)
-        left_pane.grid(row=0, column=0, sticky="n")
+	DEFAULT_WM_RATIO = 0.08575807    # logo / 圖片短邊
+	DEFAULT_OFFSET_RATIO = 0.02447917
+	VERSION = "v2.3"
 
-        # 模式選擇
-        self.mode_var = tk.StringVar(value="general")
-        tk.Label(left_pane, text="Select Mode:").pack(anchor="w", padx=10, pady=(10, 0))
-        tk.Radiobutton(left_pane, text="General Mode", variable=self.mode_var, value="general").pack(anchor="w", padx=20)
-        tk.Radiobutton(left_pane, text="Advanced Batch Mode", variable=self.mode_var, value="advanced").pack(anchor="w", padx=20)
-        
-        # 圖片處理選項
-        self.add_watermark_var = tk.BooleanVar(value=True)
-        self.add_border_var = tk.BooleanVar(value=False)
-        tk.Label(left_pane, text="Image Processing Options:").pack(anchor="w", padx=10, pady=(10, 0))
-        tk.Checkbutton(left_pane, text="Add Watermark", variable=self.add_watermark_var, command=self.toggle_watermark_option).pack(anchor="w", padx=20)
-        tk.Checkbutton(left_pane, text="Add White Border", variable=self.add_border_var).pack(anchor="w", padx=20)
-        
-        # 選擇資料夾按鈕
-        self.select_folder_button = tk.Button(left_pane, text="Select Image Folder", command=self.select_folder)
-        self.select_folder_button.pack(pady=10)
-        
-        # 顯示所選資料夾路徑
-        self.folder_path_label = tk.Label(left_pane, text="")
-        self.folder_path_label.pack(pady=5)
-        
-        # 選擇水印按鈕
-        self.select_watermark_button = tk.Button(left_pane, text="Select Watermark", command=self.select_watermark, state=tk.NORMAL)
-        self.select_watermark_button.pack(pady=10)
-        
-        # 開始處理按鈕
-        self.start_button = tk.Button(left_pane, text="Start Processing", command=self.start_processing)
-        self.start_button.pack(pady=10)
+	# ------------------------------------------------------------------ #
+	# 初始化                                                              #
+	# ------------------------------------------------------------------ #
+	def __init__(self, master: tk.Tk):
+		self.master = master
+		master.title(f"Image Processing Tool")
 
-        # 停止處理按鈕
-        self.stop_button = tk.Button(left_pane, text="Stop Processing", command=self.stop_processing_command, state=tk.DISABLED)
-        self.stop_button.pack(pady=10)
-        
-        # 初始化進度條和標籤（先初始化浮水印進度條，再初始化白邊進度條）
-        self.watermark_progress_label = tk.Label(left_pane, text="Watermark Progress: 0/0")
-        self.watermark_progress = ttk.Progressbar(left_pane, orient="horizontal", length=300, mode="determinate")
+		# 動態狀態 ------------------------------------------------------- #
+		self.image_folder: str | None = None
+		self.watermark_path: str = ""
+		self.stop_flag = False
+		self.result_q: queue.Queue[tuple[str, str]] = queue.Queue()
 
-        self.border_progress_label = tk.Label(left_pane, text="Border Progress: 0/0")
-        self.border_progress = ttk.Progressbar(left_pane, orient="horizontal", length=300, mode="determinate")
-        
-        # 記錄日誌區域
-        tk.Label(left_pane, text="Logs:").pack(anchor="w", padx=10, pady=(10, 0))
-        self.log_text = tk.Text(left_pane, height=10, width=50, state=tk.DISABLED)
-        self.log_text.pack(pady=10)
+		# Tk 綁定變數
+		self.mode_var = tk.StringVar(value="general")
+		self.size_var = tk.DoubleVar(value=self.DEFAULT_WM_RATIO)
+		self.off_x = tk.DoubleVar(value=1 - self.DEFAULT_OFFSET_RATIO)
+		self.off_y = tk.DoubleVar(value=1 - self.DEFAULT_OFFSET_RATIO)
+		self.wm_var = tk.BooleanVar(value=True)
+		self.bd_var = tk.BooleanVar(value=True)
 
-        # 右側面板（預覽與設置）
-        right_pane = tk.Frame(main_frame)
-        right_pane.grid(row=0, column=1, padx=20)
+		# 預覽與樣本快取
+		self.samples: dict[str, str | None] = {"landscape": None, "portrait": None}
+		self.base_previews: dict[str, Image.Image | None] = {"landscape": None, "portrait": None}
+		self.preview_canvases: dict[str, tk.Canvas] = {}
 
-        # 水印預覽
-        self.preview_label = tk.Label(right_pane, text="Watermark Preview:")
-        self.preview_label.pack(pady=(20, 5))
-        self.preview_canvas = tk.Canvas(right_pane, width=200, height=200, bg="#808080")  # 中性灰背景
-        self.preview_canvas.pack()
+		# 批次任務
+		self.tasks: list[tuple[str, str, str]] = []
+		self.total_tasks = 0
+		self.done_wm = 0
+		self.done_bd = 0
 
-        # 水印設置參數
-        tk.Label(right_pane, text="Watermark Settings:").pack(anchor="w", padx=10, pady=(10, 0))
-        tk.Label(right_pane, text="Transparency:").pack(anchor="w", padx=20)
-        self.transparency_var = tk.DoubleVar(value=0.5)
-        self.transparency_scale = tk.Scale(right_pane, from_=0, to=1, resolution=0.1, orient="horizontal", variable=self.transparency_var, state=tk.DISABLED)
-        self.transparency_scale.pack(anchor="w", padx=20)
-        
-        tk.Label(right_pane, text="Position Offset:").pack(anchor="w", padx=20)
-        self.position_var = tk.DoubleVar(value=0.05)
-        self.position_scale = tk.Scale(right_pane, from_=0, to=0.5, resolution=0.01, orient="horizontal", variable=self.position_var, state=tk.DISABLED)
-        self.position_scale.pack(anchor="w", padx=20)
+		# 讀取設定、建 UI、啟動輪詢
+		self._load_config()
+		self._build_ui()
+		self.master.after(100, self._poll_result_q)
 
-        # 版本號標籤
-        version_label = tk.Label(main_frame, text=f"Version: {self.version}")
-        version_label.grid(row=1, column=0, sticky="w", padx=10, pady=10)
-    
-    def toggle_watermark_option(self):
-        """根據水印選項的選擇狀態，啟用或禁用水印相關設置。"""
-        if self.add_watermark_var.get():
-            self.select_watermark_button.config(state=tk.NORMAL)
-        else:
-            self.select_watermark_button.config(state=tk.DISABLED)
-            self.watermark_path = None
-            self.preview_canvas.delete("all")
-            self.log("Watermark option disabled, skipping watermark selection.")
-    
-    def select_folder(self):
-        """選擇要處理的圖像資料夾。"""
-        self.image_folder = filedialog.askdirectory(title="Select Image Folder")
-        if self.image_folder:
-            self.folder_path_label.config(text=f"Selected folder: {self.image_folder}")
-            self.log(f"Selected folder: {self.image_folder}")
-            self.start_button.config(state=tk.NORMAL)
-        else:
-            self.log("No folder selected.")
+	# ------------------------------------------------------------------ #
+	# 設定檔 I/O                                                         #
+	# ------------------------------------------------------------------ #
+	def _load_config(self):
+		"""讀取設定檔，若不存在則建立一份新的"""
+		base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(__file__)
+		self.config_path = os.path.join(base_dir, CONFIG_FILENAME)
 
-    def select_watermark(self):
-        """選擇水印圖片文件，默認打開在當前目錄下的 Logopath 資料夾。"""
-        # 判斷是否為 PyInstaller 打包的可執行文件
-        if hasattr(sys, '_MEIPASS'):
-            # 使用 sys.executable 獲取可執行文件所在的目錄
-            base_path = os.path.dirname(sys.executable)
-        else:
-            # 否則使用腳本當前所在的目錄
-            base_path = os.path.dirname(os.path.abspath(__file__))
+		if os.path.exists(self.config_path):
+			try:
+				with open(self.config_path, "r", encoding="utf-8") as f:
+					self.config = json.load(f)
+			except Exception:
+				self.config = {}
+		else:
+			# 如果沒有就新建一份空的
+			self.config = {}
+			self._save_config()    # 順便保存一次
 
-        # 定義 Logopath 目錄
-        logopath_directory = os.path.join(base_path, "Logopath")
+		self.watermark_path = self.config.get("watermark_path", "")
 
-        # 如果 Logopath 目錄不存在，則創建它
-        if not os.path.exists(logopath_directory):
-            os.makedirs(logopath_directory)
-            self.log(f"Created Logopath directory: {logopath_directory}")
+	def _save_config(self):
+		self.config["watermark_path"] = self.watermark_path
+		with open(self.config_path, "w", encoding="utf-8") as f:
+			json.dump(self.config, f, ensure_ascii=False, indent=2)
 
-        # 打開文件對話框，默認目錄設置為 Logopath
-        self.watermark_path = filedialog.askopenfilename(
-            initialdir=logopath_directory,
-            title="Select Watermark Image", 
-            filetypes=(("Image files", "*.png;*.jpg;*.jpeg"), ("All files", "*.*"))
-        )
+	# ------------------------------------------------------------------ #
+	# UI 組裝                                                            #
+	# ------------------------------------------------------------------ #
+	def _build_ui(self):
+		self.master.columnconfigure(0, weight=0)
+		self.master.columnconfigure(1, weight=1)
 
-        if self.watermark_path:
-            self.log(f"Selected watermark: {self.watermark_path}")
-            self.display_preview()
-        else:
-            self.log("No watermark selected.")
+		# 左側控制面板 --------------------------------------------------- #
+		ctrl = ttk.Frame(self.master, padding=10)
+		ctrl.grid(row=0, column=0, sticky="ns")
 
-    def display_preview(self):
-        """顯示所選水印的預覽。"""
-        if self.watermark_path:
-            img = Image.open(self.watermark_path)
-            img.thumbnail((200, 200))
-            img_tk = ImageTk.PhotoImage(img)
-            self.preview_canvas.create_image(100, 100, image=img_tk)
-            self.preview_canvas.image = img_tk  # 保持引用以避免垃圾回收
+		ttk.Label(ctrl, text="Mode:").grid(row=0, column=0, sticky="w")
+		ttk.Radiobutton(ctrl, text="General", variable=self.mode_var, value="general").grid(row=0, column=1)
+		ttk.Radiobutton(ctrl, text="Advanced", variable=self.mode_var, value="advanced").grid(row=0, column=2)
 
-    def log(self, message):
-        """將信息寫入日誌區域，並統一格式化路徑。"""
-        formatted_message = message.replace("\\", "/")
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, formatted_message + "\n")
-        self.log_text.config(state=tk.DISABLED)
-        self.log_text.see(tk.END)
-    
-    def start_processing(self):
-        """啟動圖片處理流程。"""
-        # 重置停止標誌
-        self.stop_processing = False
-        
-        # 檢查是否有必要顯示進度條並初始化
-        if self.add_watermark_var.get() and not self.watermark_path:
-            messagebox.showerror("Error", "Watermark selected but no watermark image chosen.")
-            return
+		ttk.Checkbutton(ctrl, text="Add Watermark", variable=self.wm_var, command=self._refresh_previews)\
+			.grid(row=1, column=0, sticky="w")
+		ttk.Checkbutton(ctrl, text="Add Border", variable=self.bd_var, command=self._refresh_previews)\
+			.grid(row=1, column=1, sticky="w")
 
-        # 禁用開始按鈕並啟用停止按鈕
-        self.start_button.config(state=tk.DISABLED)
-        self.stop_button.config(state=tk.NORMAL)
+		# Logo Size 允許 1% ~ 100%（以短邊為基準）
+		ttk.Label(ctrl, text="Logo Size").grid(row=2, column=0, sticky="w")
+		ttk.Scale(
+			ctrl, from_=0.01, to=1.0,      # ← 這裡改成 1.0
+			variable=self.size_var, orient="horizontal",
+			command=lambda _e: self._refresh_previews()
+		).grid(row=2, column=1, columnspan=2, sticky="ew")
 
-        # 重置日誌區域
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.delete(1.0, tk.END)
-        self.log_text.config(state=tk.DISABLED)
+		# Offset X 允許 0% ~ 100%（相對可貼範圍）
+		ttk.Label(ctrl, text="Offset X").grid(row=3, column=0, sticky="w")
+		ttk.Scale(
+			ctrl, from_=0.0, to=1.0,       # ← 這裡改成 1.0
+			variable=self.off_x, orient="horizontal",
+			command=lambda _e: self._refresh_previews()
+		).grid(row=3, column=1, columnspan=2, sticky="ew")
 
-        # 隱藏所有進度條
-        self.watermark_progress_label.pack_forget()
-        self.watermark_progress.pack_forget()
-        self.border_progress_label.pack_forget()
-        self.border_progress.pack_forget()
+		# Offset Y 同理
+		ttk.Label(ctrl, text="Offset Y").grid(row=4, column=0, sticky="w")
+		ttk.Scale(
+			ctrl, from_=0.0, to=1.0,       # ← 這裡改成 1.0
+			variable=self.off_y, orient="horizontal",
+			command=lambda _e: self._refresh_previews()
+		).grid(row=4, column=1, columnspan=2, sticky="ew")
 
-        # 根據選項顯示進度條
-        if self.add_watermark_var.get() and not self.add_border_var.get():
-            # 只選擇了加浮水印
-            self.watermark_progress_label.config(text="Watermark Progress: 0/0")
-            self.watermark_progress["maximum"] = len(os.listdir(self.image_folder))
-            self.watermark_progress["value"] = 0
-            self.watermark_progress_label.pack(pady=5)
-            self.watermark_progress.pack(pady=10)
-        elif self.add_border_var.get() and not self.add_watermark_var.get():
-            # 只選擇了加白邊
-            self.border_progress_label.config(text="Border Progress: 0/0")
-            self.border_progress["maximum"] = len(os.listdir(self.image_folder))
-            self.border_progress["value"] = 0
-            self.border_progress_label.pack(pady=5)
-            self.border_progress.pack(pady=10)
-        elif self.add_watermark_var.get() and self.add_border_var.get():
-            # 兩者都選擇了
-            self.watermark_progress_label.config(text="Watermark Progress: 0/0")
-            self.watermark_progress["maximum"] = len(os.listdir(self.image_folder))
-            self.watermark_progress["value"] = 0
-            self.watermark_progress_label.pack(pady=5)
-            self.watermark_progress.pack(pady=10)
+		ttk.Button(ctrl, text="Reset Logo", command=self._reset_logo)\
+			.grid(row=5, column=0, columnspan=3, sticky="ew", pady=4)
 
-            self.border_progress_label.config(text="Border Progress: 0/0")
-            self.border_progress["maximum"] = len(os.listdir(self.image_folder))
-            self.border_progress["value"] = 0
-            self.border_progress_label.pack(pady=5)
-            self.border_progress.pack(pady=10)
+		ttk.Button(ctrl, text="Select Folder", command=self._select_folder).grid(row=6, column=0, sticky="ew")
+		self.folder_label = ttk.Label(ctrl, text="No folder selected", wraplength=150)
+		self.folder_label.grid(row=6, column=1, columnspan=2)
+		ttk.Button(ctrl, text="Select Watermark", command=self._select_watermark).grid(row=7, column=0, sticky="ew")
+		self.wm_path_label = ttk.Label(ctrl, text=os.path.basename(self.watermark_path) or "No watermark", wraplength=150)
+		self.wm_path_label.grid(row=7, column=1, columnspan=2)
 
-        # 啟動新線程來處理圖片，以避免阻塞主UI線程
-        processing_thread = threading.Thread(target=self.process_images)
-        processing_thread.start()
+		self.start_btn = ttk.Button(ctrl, text="Start", command=self._on_start)
+		self.start_btn.grid(row=8, column=0, sticky="ew")
+		self.stop_btn = ttk.Button(ctrl, text="Stop", command=self._on_stop, state=tk.DISABLED)
+		self.stop_btn.grid(row=8, column=1, sticky="ew")
 
-    def stop_processing_command(self):
-        """用戶請求停止處理圖片。"""
-        self.stop_processing = True
-        self.log("Processing stopped by user.")
-        self.stop_button.config(state=tk.DISABLED)
-        self.start_button.config(state=tk.NORMAL)
+		self.wm_label = ttk.Label(ctrl, text="WM: 0/0")
+		self.wm_label.grid(row=9, column=0)
+		self.wm_prog = ttk.Progressbar(ctrl, orient="horizontal", length=120, mode="determinate")
+		self.wm_prog.grid(row=9, column=1, columnspan=2)
+		self.bd_label = ttk.Label(ctrl, text="BD: 0/0")
+		self.bd_label.grid(row=10, column=0)
+		self.bd_prog = ttk.Progressbar(ctrl, orient="horizontal", length=120, mode="determinate")
+		self.bd_prog.grid(row=10, column=1, columnspan=2)
 
-    def process_images(self):
-        """實際執行圖片處理的功能，根據用戶選擇的設置加水印或加白邊，且不修改原圖。"""
-        if not self.image_folder:
-            messagebox.showerror("Error", "Image folder not selected.")
-            return
+		ttk.Label(ctrl, text="Logs:").grid(row=11, column=1, sticky="w")
+		self.log_txt = tk.Text(ctrl, height=30, width=40, font=("TkDefaultFont", 9))
+		self.log_txt.grid(row=12, column=0, columnspan=3)
 
-        if self.add_watermark_var.get() and not self.watermark_path:
-            messagebox.showerror("Error", "Watermark selected but no watermark image chosen.")
-            return
+		ttk.Label(ctrl, text=f"Version: {self.VERSION}").grid(row=13, column=0, columnspan=3, pady=3)
 
-        output_root_folder = os.path.join(self.image_folder, "IG_LOGO_Cropper")
+		# 右側預覽 ------------------------------------------------------- #
+		pv = ttk.Frame(self.master, padding=10)
+		pv.grid(row=0, column=1, sticky="nsew")
+		pv.columnconfigure(0, weight=1)
+		ttk.Label(pv, text="橫幅預覽").grid(row=0, column=0)
+		self.preview_canvases["landscape"] = tk.Canvas(pv, width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT, bg="#ddd")
+		self.preview_canvases["landscape"].grid(row=1, column=0, pady=4)
+		ttk.Label(pv, text="直幅預覽").grid(row=2, column=0)
+		self.preview_canvases["portrait"] = tk.Canvas(pv, width=PREVIEW_WIDTH, height=PREVIEW_HEIGHT, bg="#ddd")
+		self.preview_canvases["portrait"].grid(row=3, column=0, pady=4)
 
-        if os.path.exists(output_root_folder):
-            shutil.rmtree(output_root_folder)
-            self.log(f"Deleted existing folder: {output_root_folder}")
+	# ------------------------------------------------------------------ #
+	# 小工具                                                             #
+	# ------------------------------------------------------------------ #
+	def _log(self, msg: str):
+		self.log_txt.insert(tk.END, msg + "\n")
+		self.log_txt.see(tk.END)
 
-        os.makedirs(output_root_folder, exist_ok=True)
+	def _reset_logo(self):
+		"""將 Logo 相關滑桿歸回預設（右下角、原始比例）"""
+		self.size_var.set(self.DEFAULT_WM_RATIO)
+		# 右／下邊各保留 DEFAULT_OFFSET_RATIO 的邊距
+		self.off_x.set(1 - self.DEFAULT_OFFSET_RATIO)
+		self.off_y.set(1 - self.DEFAULT_OFFSET_RATIO)
+		self._refresh_previews()
 
-        # 確認模式
-        if self.mode_var.get() == "advanced":
-            # 在進階模式下，計算所有需要處理的圖片數量，並初始化進度條
-            total_images = self.count_images(self.image_folder)
-            self.init_progress_bars(total_images)
-            # 遞迴處理資料夾中的所有圖片
-            self.process_folder_recursively(self.image_folder, output_root_folder)
-        else:
-            # 在一般模式下，只處理當前資料夾中的圖片
-            image_files = [f for f in os.listdir(self.image_folder) if os.path.isfile(os.path.join(self.image_folder, f)) and f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-            total_images = len(image_files)
-            self.init_progress_bars(total_images)
-            self.process_single_folder(self.image_folder, output_root_folder)
 
-        if not self.stop_processing:
-            self.log("Processing completed successfully.")
-            messagebox.showinfo("Completed", "Image processing completed successfully.")
+	# ------------------------------------------------------------------ #
+	# 資料夾 / 檔案 選擇                                                 #
+	# ------------------------------------------------------------------ #
+	def _select_folder(self):
+		folder = filedialog.askdirectory()
+		if not folder:
+			return
+		self.image_folder = folder
+		self.folder_label.config(text=os.path.basename(folder))
+		self._load_samples()
+		self._load_base_previews()
+		self._refresh_previews()
 
-        self.stop_button.config(state=tk.DISABLED)
-        self.start_button.config(state=tk.NORMAL)
+	def _select_watermark(self):
+		path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.heif;*.heic")])
+		if not path:
+			return
+		self.watermark_path = path
+		self.wm_path_label.config(text=os.path.basename(path))
+		self._save_config()
+		self._refresh_previews()
 
-    def count_images(self, folder):
-        """遞迴計算資料夾中所有圖片的總數量，排除 IG_LOGO_Cropper 資料夾。"""
-        total_images = 0
-        for root, dirs, files in os.walk(folder):
-            if "IG_LOGO_Cropper" in root:
-                continue
-            total_images += len([f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-        return total_images
+	# ------------------------------------------------------------------ #
+	# 樣本載入與快取                                                     #
+	# ------------------------------------------------------------------ #
+	def _load_samples(self):
+		"""從資料夾挑兩張(橫/直)作預覽樣本"""
+		self.samples = {"landscape": None, "portrait": None}
+		if not self.image_folder:
+			return
+		for root, _, files in os.walk(self.image_folder):
+			if "IG_LOGO_Cropper" in root:
+				continue
+			for f in files:
+				if not f.lower().endswith(IMAGE_EXTS):
+					continue
+				p = os.path.join(root, f)
+				try:
+					with Image.open(p) as img_raw:
+						img = correct_orientation(img_raw)   # ⇐ 加入這行
+						w, h = img.size    
+					key = "landscape" if w >= h else "portrait"
+					if not self.samples[key]:
+						self.samples[key] = p
+					if all(self.samples.values()):
+						return
+				except Exception:
+					continue
 
-    def init_progress_bars(self, total_images):
-        """初始化進度條。"""
-        
-        # 隱藏所有進度條
-        self.watermark_progress_label.pack_forget()
-        self.watermark_progress.pack_forget()
-        self.border_progress_label.pack_forget()
-        self.border_progress.pack_forget()
+	def _load_base_previews(self):
+		"""把樣本圖縮好快取，滑桿變動即時 overlay"""
+		for orient, path in self.samples.items():
+			if path is None:
+				self.base_previews[orient] = None
+				continue
+			img = correct_orientation(Image.open(path))
+			w, h = img.size
+			r = min(PREVIEW_WIDTH / w, PREVIEW_HEIGHT / h)
+			new = img.resize((int(w * r), int(h * r)), Image.LANCZOS).convert("RGBA")
+			self.base_previews[orient] = new
 
-        # 根據選項顯示並初始化進度條
-        if self.add_watermark_var.get():
-            self.watermark_progress["maximum"] = total_images
-            self.watermark_progress["value"] = 0
-            self.watermark_progress_label.config(text=f"Watermark Progress: 0/{total_images}")
-            self.watermark_progress_label.pack(pady=5)
-            self.watermark_progress.pack(pady=10)
+	# ------------------------------------------------------------------
+	# 即時預覽刷新
+	# ------------------------------------------------------------------
+	def _refresh_previews(self):
+		"""
+		即時預覽：掃描第一張直幅與橫幅，並顯示（含白邊／浮水印選項）
+		"""
+		# 1. 清空所有 canvas
+		for cv in self.preview_canvases.values():
+			cv.delete("all")
 
-        if self.add_border_var.get():
-            self.border_progress["maximum"] = total_images
-            self.border_progress["value"] = 0
-            self.border_progress_label.config(text=f"Border Progress: 0/{total_images}")
-            self.border_progress_label.pack(pady=5)
-            self.border_progress.pack(pady=10)
+		# 2. 快速找直幅與橫幅範例
+		portrait_img = None
+		landscape_img = None
+		for fname in sorted(os.listdir(self.image_folder)):
+			if not fname.lower().endswith(IMAGE_EXTS):
+				continue
+			fpath = os.path.join(self.image_folder, fname)
+			try:
+				with Image.open(fpath) as im_raw:
+					im = correct_orientation(im_raw)  # ⇐ 加入這行
+					w, h = im.size                   # ← 判斷正確方向
+					if h > w and portrait_img is None:
+						portrait_img = im.copy()
+					elif w >= h and landscape_img is None:
+						landscape_img = im.copy()
+			except:
+				continue
+			if portrait_img and landscape_img:
+				break
 
-    def process_folder_recursively(self, input_folder, output_folder):
-        """Advanced Mode: 遞迴處理資料夾中的所有圖片，並保持相同的資料夾結構。"""
-        for root, dirs, files in os.walk(input_folder):
-            relative_path = os.path.relpath(root, input_folder)
-            output_dir = os.path.join(output_folder, relative_path)
-            
-            # 跳過 IG_LOGO_Cropper 資料夾
-            if "IG_LOGO_Cropper" in relative_path:
-                continue
-            
-            os.makedirs(output_dir, exist_ok=True)
-            
-            image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+		# 3. 暫存到 base_previews
+		self.base_previews["portrait"]  = portrait_img
+		self.base_previews["landscape"] = landscape_img
 
-            # 步驟1：加水印
-            if self.add_watermark_var.get():
-                for image_filename in image_files:
-                    if self.stop_processing:
-                        self.log("Processing stopped by user.")
-                        return
+		# 4. 產生並顯示縮圖（**一定要在這裡**）
+		for orient, canvas in self.preview_canvases.items():
+			base = self.base_previews.get(orient)
+			if base is None:
+				continue
 
-                    input_image_path = os.path.join(root, image_filename)
-                    output_image_path = os.path.join(output_dir, image_filename)
+			inner = base.copy()
+			iw, ih = inner.size
 
-                    add_watermark(root, output_dir, self.watermark_path, image_filename)
+			# 模擬白邊
+			if self.bd_var.get():
+				square = max(iw, ih)
+				bg = Image.new("RGBA", (square, square), "white")
+				ox = (square - iw)//2
+				oy = (square - ih)//2
+				bg.paste(inner, (ox, oy))
+				work = bg
+			else:
+				work = inner
 
-                    # 更新水印進度條
-                    self.watermark_progress["value"] += 1
-                    self.watermark_progress_label.config(text=f"Watermark Progress: {self.watermark_progress['value']}/{self.watermark_progress['maximum']}")
-                    self.master.update_idletasks()
+			# 疊浮水印
+			if self.wm_var.get() and self.watermark_path:
+				wm = Image.open(self.watermark_path).convert("RGBA")
+				short = min(iw, ih)
+				wm_w = int(self.size_var.get() * short)
+				wm = wm.resize((wm_w, wm_w), Image.LANCZOS)
+				offset = int(self.DEFAULT_OFFSET_RATIO * short)
+				dx = ox + iw - wm_w - offset
+				dy = oy + ih - wm_w - offset
+				work.paste(wm, (dx, dy), wm)
 
-            # 步驟2：加白邊
-            if self.add_border_var.get():
-                for image_filename in image_files:
-                    if self.stop_processing:
-                        self.log("Processing stopped by user.")
-                        return
+			# 縮放到 canvas 再貼上
+			ratio = min(PREVIEW_WIDTH/work.width, PREVIEW_HEIGHT/work.height, 1.0)
+			if ratio < 1.0:
+				work = work.resize((int(work.width*ratio),
+									int(work.height*ratio)),
+								   Image.LANCZOS)
 
-                    input_image_path = os.path.join(output_dir, image_filename) if self.add_watermark_var.get() else os.path.join(root, image_filename)
-                    output_image_path = os.path.join(output_dir, image_filename)
+			tkimg = ImageTk.PhotoImage(work)
+			canvas.create_image(
+				(PREVIEW_WIDTH - work.width)//2,
+				(PREVIEW_HEIGHT - work.height)//2,
+				anchor="nw", image=tkimg
+			)
+			canvas.image_ref = tkimg  # 防被 GC
 
-                    add_white_border_to_image(input_image_path, output_image_path)
+	# ------------------------------------------------------------------ #
+	# 批次處理                                                           #
+	# ------------------------------------------------------------------ #
+	def _on_start(self):
+		if not self.image_folder:
+			messagebox.showerror("Error", "Select folder first")
+			return
+		if self.wm_var.get() and not self.watermark_path:
+			messagebox.showerror("Error", "Select watermark first")
+			return
 
-                    # 更新白邊進度條
-                    self.border_progress["value"] += 1
-                    self.border_progress_label.config(text=f"Border Progress: {self.border_progress['value']}/{self.border_progress['maximum']}")
-                    self.master.update_idletasks()
+		# ---------- 1. 先清空舊輸出資料夾 ----------
+		cropper_root = os.path.join(self.image_folder, "IG_LOGO_Cropper")
+		if os.path.isdir(cropper_root):
+			shutil.rmtree(cropper_root)
 
-    def process_single_folder(self, input_folder, output_folder):
-        """General Mode: 處理單一資料夾中的所有圖片，不遞迴。"""
-        image_files = [f for f in os.listdir(input_folder) if os.path.isfile(os.path.join(input_folder, f)) and f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+		# ---------- 2. 依「模式」收集處理清單 ----------
+		self.tasks.clear()
 
-        for image_filename in image_files:
-            if self.stop_processing:
-                self.log("Processing stopped by user.")
-                return
+		if self.mode_var.get() == "general":
+			# 只處理最外層檔案，不深入子資料夾
+			out_root = cropper_root                 # 輸出統一在 IG_LOGO_Cropper
+			os.makedirs(out_root, exist_ok=True)
 
-            input_image_path = os.path.join(input_folder, image_filename)
-            output_image_path = os.path.join(output_folder, image_filename)
+			for f in os.listdir(self.image_folder):
+				if f.lower().endswith(IMAGE_EXTS):
+					self.tasks.append((self.image_folder, out_root, f))
 
-            # 如果只選擇了加浮水印
-            if self.add_watermark_var.get() and not self.add_border_var.get():
-                add_watermark(input_folder, output_folder, self.watermark_path, image_filename)
-                self.watermark_progress["value"] += 1
-                self.watermark_progress_label.config(text=f"Watermark Progress: {self.watermark_progress['value']}/{self.watermark_progress['maximum']}")
-                self.master.update_idletasks()
+		else:   # advanced mode ─ 含所有子資料夾
+			for root, _dirs, files in os.walk(self.image_folder):
+				out_root = os.path.join(
+					self.image_folder, "IG_LOGO_Cropper",
+					os.path.relpath(root, self.image_folder)
+				)
+				os.makedirs(out_root, exist_ok=True)
 
-            # 如果只選擇了加白邊
-            elif self.add_border_var.get() and not self.add_watermark_var.get():
-                add_white_border_to_image(input_image_path, output_image_path)
-                self.border_progress["value"] += 1
-                self.border_progress_label.config(text=f"Border Progress: {self.border_progress['value']}/{self.border_progress['maximum']}")
-                self.master.update_idletasks()
+				for f in files:
+					if f.lower().endswith(IMAGE_EXTS):
+						self.tasks.append((root, out_root, f))
+		self.total_tasks = len(self.tasks)
+		if not self.total_tasks:
+			messagebox.showinfo("Info", "No images found")
+			return
 
-            # 如果兩者都選擇了
-            elif self.add_watermark_var.get() and self.add_border_var.get():
-                add_watermark(input_folder, output_folder, self.watermark_path, image_filename)
-                add_white_border_to_image(output_image_path, output_image_path)
-                self.watermark_progress["value"] += 1
-                self.watermark_progress_label.config(text=f"Watermark Progress: {self.watermark_progress['value']}/{self.watermark_progress['maximum']}")
-                self.border_progress["value"] += 1
-                self.border_progress_label.config(text=f"Border Progress: {self.border_progress['value']}/{self.border_progress['maximum']}")
-                self.master.update_idletasks()
+		# 進度條初始化
+		self.done_wm = self.done_bd = 0
+		self.wm_prog.configure(maximum=self.total_tasks, value=0)
+		self.bd_prog.configure(maximum=self.total_tasks, value=0)
+		self.wm_label.configure(text=f"WM: 0/{self.total_tasks}")
+		self.bd_label.configure(text=f"BD: 0/{self.total_tasks}")
+
+		self.stop_flag = False
+		self.start_btn.config(state=tk.DISABLED)
+		self.stop_btn.config(state=tk.NORMAL)
+		threading.Thread(target=self._process_worker, daemon=True).start()
+
+	# ------------------------------------------------------------------
+	# 背景批次處理：限制執行緒 ≒ 80 % CPU
+	# ------------------------------------------------------------------
+	def _process_worker(self):
+		"""實際進行批次處理（背景執行緒）"""
+
+		# 計算「最多使用的執行緒數」= CPU 核心數 × 0.8
+		max_threads = max(1, int((os.cpu_count() or 1) * 0.8))
+
+		# ── 1. 浮水印 ────────────────────────────────────────────────
+		if self.wm_var.get():
+			with ThreadPoolExecutor(max_workers=max_threads) as ex:
+				futures = [ex.submit(self._apply_watermark, t) for t in self.tasks]
+				for fut in as_completed(futures):
+					if self.stop_flag:
+						break
+					fname = fut.result()
+					if fname:                           # 失敗時 _apply_watermark 會回傳 None
+						self.result_q.put(("wm", fname))
+
+		# ── 2. 白邊 ─────────────────────────────────────────────────
+		if self.bd_var.get() and not self.stop_flag:
+			with ThreadPoolExecutor(max_workers=max_threads) as ex:
+				futures = [ex.submit(self._apply_border, t) for t in self.tasks]
+				for fut in as_completed(futures):
+					if self.stop_flag:
+						break
+					fname = fut.result()
+					self.result_q.put(("bd", fname))
+
+		# ── 3. 全部完成 ────────────────────────────────────────────
+		self.result_q.put(("done", ""))
+
+	# ------------------------------------------------------------------
+	# 載入 → 加浮水印 → 存檔
+	# ------------------------------------------------------------------
+	def _apply_watermark(self, task: tuple[str, str, str]) -> str | None:
+		# 一次正確拆解三個參數
+		root, out_root, fname = task
+
+		# 設定完整來源／輸出路徑
+		src = os.path.join(root, fname)
+		dst = os.path.join(out_root, fname)
+
+		# 讀檔並修正方向
+		try:
+			img = correct_orientation(Image.open(src)).convert("RGBA")
+		except Exception as e:
+			self.result_q.put(("err", f"[Skip] {fname} ‒ {e}"))
+			return None
+
+		# 浮水印尺寸（短邊比例）
+		short_side = min(img.width, img.height)
+		wm_w       = int(self.size_var.get() * short_side)
+		wm         = Image.open(self.watermark_path).convert("RGBA")
+		wm         = wm.resize((wm_w, wm_w), Image.LANCZOS)
+
+		# 固定 X/Y Offset = 0.02447917 × short_side
+		offset_px  = int(0.02447917 * short_side)
+		dest_x     = max(img.width  - wm_w - offset_px, 0)
+		dest_y     = max(img.height - wm_w - offset_px, 0)
+
+		# 貼浮水印並存檔
+		img.paste(wm, (dest_x, dest_y), wm)
+		img.convert("RGB").save(dst, quality=95)
+		return fname
+	
+	def _apply_border(self, task: tuple[str, str, str]) -> str:
+		"""
+		給目前檔案加白邊（正方形 2048×2048）  
+		回傳檔名供 UI 更新進度／日誌
+		"""
+		# 正確拆解三個元素
+		root, out_root, fname = task
+
+		# 直接以「來源資料夾」、「目的資料夾」、「檔名」呼叫
+		add_white_border_to_image(root, out_root, fname)
+		return fname
+
+	# ------------------------------------------------------------------ #
+	# 主執行緒輪詢 queue，更新 UI                                        #
+	# ------------------------------------------------------------------ #
+	def _poll_result_q(self):
+		try:
+			while True:
+				stage, fname = self.result_q.get_nowait()
+				if stage == "wm":
+					self.done_wm += 1
+					self.wm_prog["value"] = self.done_wm
+					self.wm_label.configure(text=f"WM: {self.done_wm}/{self.total_tasks}")
+					self._log(f"Watermark added: {fname}")
+				elif stage == "bd":
+					self.done_bd += 1
+					self.bd_prog["value"] = self.done_bd
+					self.bd_label.configure(text=f"BD: {self.done_bd}/{self.total_tasks}")
+					self._log(f"Border added: {fname}")
+				elif stage == "err":
+					self._log(fname)		# fname 這裡其實是錯誤訊息字串
+				elif stage == "done":
+					self._finish()
+		except queue.Empty:
+			pass
+		finally:
+			self.master.after(100, self._poll_result_q)
+
+	def _on_stop(self):
+		self.stop_flag = True
+		self._log("Stop requested")
+
+	def _finish(self):
+		self.start_btn.config(state=tk.NORMAL)
+		self.stop_btn.config(state=tk.DISABLED)
+		self._log("Processing complete")
+		messagebox.showinfo("Done", "Processing complete")
+
+# ---------------------------------------------------------------------- #
+# 入口                                                                   #
+# ---------------------------------------------------------------------- #
+def resource_path(relative_path):
+	"""打包後取得資源的正確路徑"""
+	if hasattr(sys, '_MEIPASS'):
+		return os.path.join(sys._MEIPASS, relative_path)
+	return os.path.join(os.path.abspath("."), relative_path)
 
 def start_ui():
-    """啟動應用的主UI。"""
-    root = tk.Tk()
-    app = ImageProcessingApp(root)
-    root.mainloop()
+	root = tk.Tk()
+	# 這裡改用 resource_path 找 icon
+	icon_path = resource_path('ig.ico')
+	root.iconbitmap(icon_path)
 
-if __name__ == "__main__":
-    start_ui()
+	app = ImageProcessingApp(root)
+	root.mainloop()
