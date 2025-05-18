@@ -272,25 +272,47 @@ class ImageProcessingApp:
 		for cv in self.preview_canvases.values():
 			cv.delete("all")
 
-		# 2. 快速找直幅與橫幅範例
+		# 2. 快速找直幅與橫幅範例（5 秒超時）
+		import time
 		portrait_img = None
 		landscape_img = None
-		for fname in sorted(os.listdir(self.image_folder)):
-			if not fname.lower().endswith(IMAGE_EXTS):
-				continue
-			fpath = os.path.join(self.image_folder, fname)
-			try:
-				with Image.open(fpath) as im_raw:
-					im = correct_orientation(im_raw)  # ⇐ 加入這行
-					w, h = im.size                   # ← 判斷正確方向
-					if h > w and portrait_img is None:
-						portrait_img = im.copy()
-					elif w >= h and landscape_img is None:
-						landscape_img = im.copy()
-			except:
-				continue
-			if portrait_img and landscape_img:
+		start_time = time.time()
+
+		# advanced 模式才遞迴，否則只掃當前資料夾
+		walker = os.walk(self.image_folder) if self.mode_var.get() == "advanced" else [
+			(self.image_folder, [], os.listdir(self.image_folder))
+		]
+		for root, _dirs, files in walker:
+			for fname in sorted(files):
+				# 檢查是否超時
+				if time.time() - start_time > 5:
+					break
+
+				if not fname.lower().endswith(IMAGE_EXTS):
+					continue
+				fpath = os.path.join(root, fname)
+				try:
+					with Image.open(fpath) as im_raw:
+						im = correct_orientation(im_raw)
+						w, h = im.size
+						if h > w and portrait_img is None:
+							portrait_img = im.copy()
+						elif w >= h and landscape_img is None:
+							landscape_img = im.copy()
+				except:
+					continue
+
+				# 找到各一張後立刻跳出
+				if portrait_img and landscape_img:
+					break
+
+			# 如果兩張都找到，或已超時，就終止所有搜尋
+			if (portrait_img and landscape_img) or (time.time() - start_time > 5):
 				break
+
+		# 只把已找到的那張丟去預覽
+		self.base_previews["portrait"]  = portrait_img
+		self.base_previews["landscape"] = landscape_img
 
 		# 3. 暫存到 base_previews
 		self.base_previews["portrait"]  = portrait_img
