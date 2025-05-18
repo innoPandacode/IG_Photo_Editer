@@ -58,5 +58,6 @@ IG_Photo_Editer-*.zip
 LOGOPATH/
 img/
 *.ico
+*config.json
 *封包命令.txt
 v2.*/  # 所有版本子資料夾，如 v2.4/
