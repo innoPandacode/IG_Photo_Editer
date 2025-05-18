@@ -1,6 +1,6 @@
 # IG_Photo_Editer
 
-**版本：2.1**
+**版本：2.4**
 
 ## 專案簡介
 
@@ -37,7 +37,7 @@
    - 點擊 "Select Image Folder" 按鈕，選擇需要處理的圖片資料夾。
 
 4. **選擇處理模式**
-   - 在左側面板中選擇 "General Mode" 或 "Advanced Batch Mode"。
+   - 在左側面板中選擇 "General Mode" (單一資料夾處裡) 或 "Advanced Batch Mode" (含有子資料夾的處裡)。
    - 根據需求選擇 "Add Watermark" 或 "Add White Border" 選項。
 
 5. **選擇浮水印**
@@ -48,7 +48,7 @@
 
 ## 注意事項
 
-- 確保所有圖片格式支援：`png`, `jpg`, `jpeg`。
+- 確保所有圖片格式支援：`png`, `jpg`, `jpeg` , `heif`, `heic`。
 - 處理結果將儲存在選擇的圖片資料夾內新建的 `IG_LOGO_Cropper` 資料夾中。
 
 ## 開發者
@@ -58,5 +58,7 @@
 
 ## 版本歷史
 
-- **2.1**: 現行版本。新增UI介面和修正部分BUG。
+- **2.1**: 新增UI介面和修正部分BUG。
+- **2.3**: 修正UI介面和修正部分BUG與加速輸出。
+- **2.3**: 修正UI Prevew 介面 Bug。
 
