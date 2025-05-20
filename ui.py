@@ -34,7 +34,7 @@ class ImageProcessingApp:
 
 	DEFAULT_WM_RATIO = 0.08575807    # logo / 圖片短邊
 	DEFAULT_OFFSET_RATIO = 0.02447917
-	VERSION = "v2.3"
+	VERSION = "v2.4"
 
 	# ------------------------------------------------------------------ #
 	# 初始化                                                              #
