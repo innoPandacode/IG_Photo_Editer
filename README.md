@@ -61,7 +61,7 @@
 
 以下為工具在進階模式下的橫幅與直幅預覽示例：
 
-<img src="./image/preview.png" alt="預覽" width="300px">
+<img src="./image/preview.png" alt="預覽" width="500px">
 
 
 ## 開發者
